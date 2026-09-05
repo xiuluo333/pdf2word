@@ -1,0 +1,20 @@
+[project]
+name = "qwentoword"
+version = "0.1.0"
+description = "Local tools for extracting highlighted PDF vocabulary and generating study cards"
+readme = "../README.md"
+license = { file = "../LICENSE" }
+authors = [{ name = "xik" }]
+requires-python = ">=3.12"
+dependencies = [
+  "openpyxl>=3.1.0",
+]
+
+[project.optional-dependencies]
+pdf = ["pymupdf>=1.24.0"]
+ai = [
+  "modelscope>=1.20.0",
+  "transformers>=4.51.0",
+  "accelerate>=1.0.0",
+  "torch>=2.6.0",
+]
