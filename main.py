@@ -11,6 +11,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -19,24 +21,31 @@ from typing import Any
 
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-9B"
+BASE_DIR = Path(__file__).resolve().parent
 
 FIELD_HEADERS = {
     "translate": "translate",
+    "english_definition": "English definition",
+    "phonetic": "phonetic",
     "part_of_speech": "part of speech",
     "transformation": "Transformation",
     "memory_techniques": "Memory techniques",
     "distinguishing_between_similar_words": (
         "Distinguishing between similar words"
     ),
+    "example_sentence": "example sentence",
 }
 RESPONSE_FIELDS = tuple(FIELD_HEADERS)
 
 JSON_OUTPUT_FORMAT = """{
   "translate": "中文释义",
+  "english_definition": "简洁、准确的英文释义",
+  "phonetic": "英式 IPA 音标，例如 /ˈwɜːd/",
   "part_of_speech": "词性缩写",
   "transformation": "词形变化；没有特殊变化时填写无",
   "memory_techniques": "记忆方法",
-  "distinguishing_between_similar_words": "近义词辨析；没有必要对比时填写无"
+  "distinguishing_between_similar_words": "近义词辨析；没有必要对比时填写无",
+  "example_sentence": "包含该单词的简单日常生活对话短句"
 }"""
 
 SYSTEM_PROMPT = """你是一名严谨的考研英语词汇教师和词典编辑。
@@ -52,15 +61,18 @@ JSON 必须严格按照下面的格式输出，键名必须完全一致，不能
 
 字段要求：
 1. translate：给出最常见的中文释义；有多个重要词性时分号分隔，并标注词性。
-2. part_of_speech：使用简洁英文缩写，例如 "n.; v."、"adj."、"prep."。
-3. transformation：给出重要词形变化，如复数、过去式、过去分词、现在分词、
+2. english_definition：用简洁、自然、准确的英文解释单词核心含义；不要重复单词本身或写中文。
+3. phonetic：给出该单词的标准英式 IPA 音标，使用 /.../ 包裹；不要给美式音标或额外说明。
+4. part_of_speech：使用简洁英文缩写，例如 "n.; v."、"adj."、"prep."。
+5. transformation：给出重要词形变化，如复数、过去式、过去分词、现在分词、
    比较级/最高级等；格式清晰。没有特殊变化时写 "无"，不要臆造词形。
-4. memory_techniques：优先给出词根词缀、构词法或可靠联想；无法可靠拆分时，
+6. memory_techniques：优先给出词根词缀、构词法或可靠联想；无法可靠拆分时，
    给出简短、合理的记忆联想。不要编造词源，控制在 1-2 句。
-5. distinguishing_between_similar_words：列出最容易混淆的 1-3 个词，如adopt和adapt，说明核心
+7. distinguishing_between_similar_words：列出最容易混淆的 1-3 个词，如adopt和adapt，说明核心
    区别和典型用法；没有必要对比时写 "无"。不要为了凑数列生僻词，更不要生成 "passage 与 passage 易混淆..." 这类同一个词的幻觉。
+8. example_sentence：用该单词写一个简短、自然、常见的日常生活英语对话短句，控制在 5-15 个单词；只写英语句子，可在句末用括号补充一句简短中文含义。
 
-不要把频次编号当成释义，也不要输出例句、音标或额外字段。"""
+不要把频次编号当成释义，也不要输出额外字段。"""
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,14 +82,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path(os.getenv("VOCAB_INPUT", "考研生词.xlsx")),
+        default=Path(os.getenv("VOCAB_INPUT", str(BASE_DIR / "考研生词.xlsx"))),
         help="Input workbook path (default: 考研生词.xlsx).",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="Output workbook path; defaults to updating the input file in place.",
+        help="Output workbook path; defaults to <input stem>_processed.xlsx.",
     )
     parser.add_argument(
         "--sheet",
@@ -110,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         "--model-dir",
         dest="model_cache_dir",
         type=Path,
-        default=Path(os.getenv("MODELSCOPE_CACHE_DIR", "models")),
+        default=Path(os.getenv("MODELSCOPE_CACHE_DIR", str(BASE_DIR / "models"))),
         help=(
             "Local ModelScope cache directory (default: ./models, or "
             "MODELSCOPE_CACHE_DIR)."
@@ -127,6 +139,9 @@ def parse_args() -> argparse.Namespace:
         default=int(os.getenv("MODEL_MAX_NEW_TOKENS", "1200")),
         help="Maximum number of tokens generated for each word (default: 1200).",
     )
+    parser.add_argument("--html-output", type=Path, default=None, help="Generated HTML path; defaults beside output workbook.")
+    parser.add_argument("--words", type=Path, default=None, help="Phonetic JSON path; defaults to words.json beside input.")
+    parser.add_argument("--no-html", action="store_true", help="Skip HTML generation.")
     return parser.parse_args()
 
 
@@ -161,6 +176,24 @@ def find_columns(sheet: Any) -> dict[str, int]:
     }
 
 
+def ensure_columns(sheet: Any) -> dict[str, int]:
+    """Append generated columns so the source workbook may contain only word/number."""
+    headers = {
+        normalise_header(cell.value): cell.column
+        for cell in sheet[1]
+        if cell.value is not None
+    }
+    if "word" not in headers:
+        raise ValueError("Workbook is missing required header: word")
+    for header in FIELD_HEADERS.values():
+        key = normalise_header(header)
+        if key not in headers:
+            column = sheet.max_column + 1
+            sheet.cell(1, column).value = header
+            headers[key] = column
+    return find_columns(sheet)
+
+
 def is_blank(value: Any) -> bool:
     return value is None or not str(value).strip()
 
@@ -174,12 +207,12 @@ def build_user_prompt(word: str, frequency: Any, missing_fields: list[str]) -> s
 词表中的频次/编号：{frequency_text}
 需要补全的字段：{missing}
 
-即使只需要补全部分字段，也必须返回系统要求的全部 5 个键；无需补全的键仍给出
+即使只需要补全部分字段，也必须返回系统要求的全部 {len(RESPONSE_FIELDS)} 个键；无需补全的键仍给出
 准确内容，但程序只会写入原本为空的单元格。
 
 必须严格返回以下 JSON 格式（不要 Markdown 代码围栏或额外文字）：
 {JSON_OUTPUT_FORMAT}
-所有 5 个键都必须存在，所有值都必须是非空字符串。"""
+所有 {len(RESPONSE_FIELDS)} 个键都必须存在，所有值都必须是非空字符串。"""
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -242,6 +275,14 @@ def validate_completion_result(value: Any) -> dict[str, str]:
         if not isinstance(field_value, str) or not field_value.strip():
             raise ValueError(f"Model response field {key!r} must be a non-empty string")
         result[key] = field_value.strip()
+    if not re.search(r"[A-Za-z]", result["english_definition"]) or re.search(
+        r"[\u3400-\u9fff]", result["english_definition"]
+    ):
+        raise ValueError("english_definition must contain an English definition without Chinese")
+    if not re.fullmatch(r"/[^/\n]+/", result["phonetic"]) or re.search(
+        r"[\u3400-\u9fff]", result["phonetic"]
+    ):
+        raise ValueError("phonetic must be an IPA transcription enclosed in /.../")
     return result
 
 
@@ -253,6 +294,24 @@ class LocalQwen:
     model: Any
     input_device: Any
     max_new_tokens: int
+
+
+def load_inference_dependencies() -> tuple[Any, Any, Any]:
+    """Check imports before downloading, preserving the actual failure reason."""
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise RuntimeError(
+            f"Could not import local inference dependencies.\n"
+            f"Python: {sys.executable}\n"
+            f"Original error: {type(exc).__name__}: {exc}\n"
+            "In the same Python environment, run: python -m pip install -U "
+            "-r requirements.txt\n"
+            "If the packages are already installed, inspect the original error "
+            "for incompatible versions or missing shared libraries."
+        ) from exc
+    return torch, AutoModelForCausalLM, AutoTokenizer
 
 
 def download_model(model_id: str, cache_dir: Path) -> Path:
@@ -293,15 +352,8 @@ def load_local_model(
     if max_new_tokens <= 0:
         raise ValueError("max_new_tokens must be greater than zero")
 
+    torch, AutoModelForCausalLM, AutoTokenizer = load_inference_dependencies()
     model_path = download_model(model_id, cache_dir)
-    try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ImportError as exc:
-        raise RuntimeError(
-            "Local inference requires Transformers and PyTorch. Install them with "
-            "`pip install -r requirements.txt`."
-        ) from exc
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -310,7 +362,7 @@ def load_local_model(
             local_files_only=True,
         )
     except (OSError, RuntimeError, ValueError) as exc:
-        raise RuntimeError(f"Could not load tokenizer from {model_path}") from exc
+        raise RuntimeError(f"Could not load tokenizer from {model_path}: {exc}") from exc
     if (
         getattr(tokenizer, "pad_token_id", None) is None
         and getattr(tokenizer, "eos_token_id", None) is not None
@@ -341,7 +393,7 @@ def load_local_model(
     try:
         model = AutoModelForCausalLM.from_pretrained(str(model_path), **model_kwargs)
     except (OSError, RuntimeError, ValueError) as exc:
-        raise RuntimeError(f"Could not load local model from {model_path}") from exc
+        raise RuntimeError(f"Could not load local model from {model_path}: {exc}") from exc
     if not use_device_map:
         model = model.to(torch.device(requested_device))
     model.eval()
@@ -480,7 +532,9 @@ def fill_workbook(
 
     workbook = load_workbook(input_path)
     sheet = workbook[sheet_name] if sheet_name else workbook.active
-    columns = find_columns(sheet)
+    columns = ensure_columns(sheet)
+    # Create the requested output even when every row is already complete.
+    save_workbook_atomic(workbook, output_path)
     processed = 0
     skipped = 0
     failed = 0
@@ -538,6 +592,27 @@ def main() -> None:
     args = parse_args()
     if not args.input.exists():
         raise SystemExit(f"Input workbook not found: {args.input}")
+    output_path = args.output or args.input.with_name(f"{args.input.stem}_processed.xlsx")
+    words_path = args.words or args.input.with_name("words.json")
+    # Work on a separate copy and seed dictionary fields before asking the model
+    # for the remaining pedagogical fields. Existing output is kept so runs can
+    # be resumed safely.
+    if output_path.resolve() != args.input.resolve() and not output_path.exists():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(args.input, output_path)
+    try:
+        try:
+            from . import generate_html as html_generator
+        except ImportError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("qwentoword_html", Path(__file__).with_name("generate_html.py"))
+            if spec is None or spec.loader is None:
+                raise RuntimeError("Could not load generate_html.py")
+            html_generator = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(html_generator)
+        html_generator.update_workbook(output_path, words_path, args.sheet)
+    except (OSError, ValueError, ImportError) as exc:
+        raise SystemExit(f"Could not seed dictionary fields: {exc}") from exc
     try:
         model = load_local_model(
             model_id=args.model_id,
@@ -547,15 +622,18 @@ def main() -> None:
         )
     except (RuntimeError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
-    output_path = args.output or args.input
     fill_workbook(
-        input_path=args.input,
+        input_path=output_path,
         output_path=output_path,
         sheet_name=args.sheet,
         request_interval=args.request_interval,
         max_retries=max(0, args.max_retries),
         model=model,
     )
+    if not args.no_html:
+        html_output = args.html_output or output_path.with_suffix(".html")
+        count = html_generator.generate(output_path, html_output, args.sheet, words_path)
+        print(f"Generated {html_output} with {count} vocabulary cards.")
 
 
 if __name__ == "__main__":

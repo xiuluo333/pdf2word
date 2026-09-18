@@ -1,4 +1,0 @@
-  python test.py docs/words.pdf \
-    --color "#ffff00" \
-    --excel highlights.xlsx \
-    --review-pdf checked.pdf

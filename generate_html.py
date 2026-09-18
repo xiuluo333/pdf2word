@@ -1,6 +1,6 @@
 """Update vocabulary metadata and generate a browser-based reader.
 
-Run ``python html.py`` to add unique IDs and local ``words.json`` phonetics to
+Run ``python generate_html.py`` to add unique IDs and local ``words.json`` phonetics to
 ``考研生词.xlsx``, then create ``考研生词.html``.  The generated document is
 self-contained: workbook data is embedded as JSON and all interaction is
 implemented in the page itself, so it can be opened directly from disk.
@@ -18,10 +18,14 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from xml.etree import ElementTree
 
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
 FIELD_ALIASES = {
     "id": ("id", "word id", "word_id", "单词编号", "唯一编号"),
     "word": ("word", "单词", "词汇"),
     "translate": ("translate", "translation", "释义", "翻译", "中文释义"),
+    "english_definition": ("English definition", "english_definition", "英译英", "英文释义"),
     "number": ("number", "编号", "频次", "frequency"),
     "part_of_speech": ("part of speech", "part_of_speech", "词性"),
     "transformation": ("transformation", "word forms", "词形变化"),
@@ -40,12 +44,15 @@ FIELD_ALIASES = {
         "英式音标",
         "美式音标",
     ),
+    "example_sentence": (
+        "example sentence", "example", "sentence", "例句", "日常例句", "对话例句"
+    ),
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Add vocabulary IDs/phonetics to Excel and generate its study webpage.")
-    parser.add_argument("--input", type=Path, default=Path(os.getenv("VOCAB_INPUT", "考研生词.xlsx")))
+    parser.add_argument("--input", type=Path, default=Path(os.getenv("VOCAB_INPUT", str(BASE_DIR / "考研生词.xlsx"))))
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--sheet", default=None, help="Worksheet name; defaults to the active worksheet.")
     parser.add_argument("--words", type=Path, default=None, help="Phonetic JSON path; defaults to words.json beside the workbook.")
@@ -74,8 +81,8 @@ def find_columns(headers: list[Any]) -> dict[str, int | None]:
     return result
 
 
-def load_phonetics(path: Path) -> dict[str, str]:
-    """Load ``word -> phonetic`` entries from the local words.json file."""
+def load_word_data(path: Path) -> dict[str, dict[str, str]]:
+    """Load word metadata (phonetic and dictionary meaning) from words.json."""
 
     if not path.exists():
         return {}
@@ -97,15 +104,22 @@ def load_phonetics(path: Path) -> dict[str, str]:
     else:
         raise ValueError("Phonetic JSON must be a list or an object mapping words to phonetics")
 
-    result: dict[str, str] = {}
+    result: dict[str, dict[str, str]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         word = cell_text(entry.get("word"))
-        phonetic = cell_text(entry.get("phonetic"))
-        if word and phonetic:
-            result.setdefault(word.casefold(), phonetic)
+        if word:
+            result.setdefault(word.casefold(), {
+                "phonetic": cell_text(entry.get("phonetic")),
+                "translate": cell_text(entry.get("meaning") or entry.get("translate") or entry.get("translation")),
+            })
     return result
+
+
+def load_phonetics(path: Path) -> dict[str, str]:
+    """Backward-compatible helper returning only phonetics."""
+    return {word: data["phonetic"] for word, data in load_word_data(path).items() if data.get("phonetic")}
 
 
 def next_word_id(used_ids: set[str]) -> str:
@@ -126,7 +140,7 @@ def _rows_from_values(headers: list[Any], data_rows: list[tuple[int, list[Any]]]
     """Convert worksheet values into the small, stable JSON schema used by the page."""
 
     columns = find_columns(headers)
-    fields = ("translate", "number", "part_of_speech", "transformation", "memory_techniques", "similar_words", "phonetic")
+    fields = ("translate", "english_definition", "number", "part_of_speech", "transformation", "memory_techniques", "similar_words", "phonetic", "example_sentence")
     rows: list[dict[str, str]] = []
     for source_index, values in data_rows:
         word_column = columns["word"]
@@ -258,7 +272,7 @@ def load_rows(path: Path, sheet_name: str | None = None) -> list[dict[str, str]]
         workbook.close()
 
 
-def _update_workbook_with_openpyxl(path: Path, phonetics: dict[str, str], sheet_name: str | None) -> None:
+def _update_workbook_with_openpyxl(path: Path, word_data: dict[str, dict[str, str]], sheet_name: str | None) -> None:
     import openpyxl
 
     workbook = openpyxl.load_workbook(path)
@@ -276,6 +290,12 @@ def _update_workbook_with_openpyxl(path: Path, phonetics: dict[str, str], sheet_
         phonetic_column = columns["phonetic"]
         if phonetic_column is None:
             phonetic_column = next_column
+            next_column += 1
+        translate_column = columns["translate"]
+        if translate_column is None:
+            translate_column = next_column
+            next_column += 1
+            sheet.cell(1, translate_column + 1).value = "translate"
         if columns["id"] is None:
             sheet.cell(1, id_column + 1).value = "id"
         if columns["phonetic"] is None:
@@ -295,9 +315,15 @@ def _update_workbook_with_openpyxl(path: Path, phonetics: dict[str, str], sheet_
 
             phonetic_cell = sheet.cell(row_number, phonetic_column + 1)
             if not cell_text(phonetic_cell.value):
-                phonetic = phonetics.get(word.casefold(), "")
+                metadata = word_data.get(word.casefold(), {})
+                phonetic = metadata.get("phonetic", "")
                 if phonetic:
                     phonetic_cell.value = phonetic
+            translate_cell = sheet.cell(row_number, translate_column + 1)
+            translation = word_data.get(word.casefold(), {}).get("translate", "")
+            if translation:
+                # The local dictionary is the authoritative source for this field.
+                translate_cell.value = translation
         workbook.save(path)
     finally:
         workbook.close()
@@ -312,7 +338,7 @@ def _xml_column_letters(index: int) -> str:
     return result
 
 
-def _update_workbook_with_xml(path: Path, phonetics: dict[str, str], sheet_name: str | None) -> None:
+def _update_workbook_with_xml(path: Path, word_data: dict[str, dict[str, str]], sheet_name: str | None) -> None:
     """Update metadata in an XLSX when openpyxl is unavailable."""
 
     main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -406,6 +432,10 @@ def _update_workbook_with_xml(path: Path, phonetics: dict[str, str], sheet_name:
             if phonetic_column is None:
                 max_column += 1
                 phonetic_column = max_column
+            translate_column = columns["translate"]
+            if translate_column is None:
+                max_column += 1
+                translate_column = max_column
 
             def find_or_create_cell(row: ElementTree.Element, column: int, number: int) -> ElementTree.Element:
                 for cell in row.findall("m:c", ns):
@@ -432,6 +462,7 @@ def _update_workbook_with_xml(path: Path, phonetics: dict[str, str], sheet_name:
             first_number = row_number(header_row, 1)
             set_inline_string(find_or_create_cell(header_row, id_column, first_number), "id")
             set_inline_string(find_or_create_cell(header_row, phonetic_column, first_number), "phonetic")
+            set_inline_string(find_or_create_cell(header_row, translate_column, first_number), "translate")
             used_ids: set[str] = set()
             for position, row in enumerate(sheet_rows[1:], start=2):
                 number = row_number(row, position)
@@ -447,9 +478,13 @@ def _update_workbook_with_xml(path: Path, phonetics: dict[str, str], sheet_name:
                 used_ids.add(current_id)
                 phonetic_cell = find_or_create_cell(row, phonetic_column, number)
                 if not read_cell(phonetic_cell):
-                    phonetic = phonetics.get(word.casefold(), "")
+                    phonetic = word_data.get(word.casefold(), {}).get("phonetic", "")
                     if phonetic:
                         set_inline_string(phonetic_cell, phonetic)
+                translate_cell = find_or_create_cell(row, translate_column, number)
+                translation = word_data.get(word.casefold(), {}).get("translate", "")
+                if translation:
+                    set_inline_string(translate_cell, translation)
 
             dimension = sheet_root.find("m:dimension", ns)
             if dimension is not None:
@@ -468,13 +503,13 @@ def _update_workbook_with_xml(path: Path, phonetics: dict[str, str], sheet_name:
 
 
 def update_workbook(path: Path, words_path: Path, sheet_name: str | None = None) -> None:
-    phonetics = load_phonetics(words_path)
+    word_data = load_word_data(words_path)
     try:
         import openpyxl  # noqa: F401
     except ImportError:
-        _update_workbook_with_xml(path, phonetics, sheet_name)
+        _update_workbook_with_xml(path, word_data, sheet_name)
     else:
-        _update_workbook_with_openpyxl(path, phonetics, sheet_name)
+        _update_workbook_with_openpyxl(path, word_data, sheet_name)
 
 
 HTML_TEMPLATE = r'''<!doctype html>
@@ -549,10 +584,33 @@ HTML_TEMPLATE = r'''<!doctype html>
     .detail-label { color: var(--muted); font-size: .73rem; font-weight: 800; letter-spacing: .05em; }
     .detail-value { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #405154; }
     .detail-value.empty { color: #a4afad; font-style: italic; }
+    .example-button { display: inline; border: 0; border-bottom: 1px dashed var(--accent); padding: 0 2px; text-align: left; background: transparent; color: inherit; cursor: pointer; }
+    .example-button:hover, .example-button:focus-visible { border-bottom-style: solid; color: var(--accent); outline: 0; }
+    .example-button svg { width: 14px; height: 14px; margin-right: 5px; vertical-align: -2px; }
     .empty-state { display: none; padding: 54px 20px; border: 1px dashed #bdcecb; border-radius: 7px; text-align: center; color: var(--muted); }
     .empty-state.visible { display: block; }
     .loading { padding: 20px; color: var(--muted); text-align: center; font-size: .8rem; }
-    .sentinel { height: 1px; }
+    [hidden] { display: none !important; }
+    .study-toolbar, .pagination, .card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+    .study-toolbar { margin-top: 14px; font-size: .8rem; }
+    .study-toolbar button, .pagination button, .card-actions button { padding: 8px 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); color: var(--accent); }
+    button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    button:disabled { opacity: .45; cursor: default; }
+    .card-actions { justify-content: space-between; padding: 12px 18px; border-top: 1px solid var(--line); }
+    .card-actions button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+    .card-back { padding: 24px 18px; min-height: 220px; }
+    .card-back .word { margin-bottom: 24px; }
+    .card-back .detail-value { line-height: 1.8; }
+    .card-head > div:first-child { min-width: 0; }
+    .word, #progress-label { overflow-wrap: anywhere; }
+    .word-meta { flex-wrap: wrap; }
+    .pagination { justify-content: center; padding: 24px 0; }
+    #storage-status { color: var(--muted); margin: 10px 0 0; font-size: .75rem; }
+    #storage-status.error { color: #a13420; }
+    #grid { scroll-margin-top: 340px; }
+    .card { scroll-margin-top: 340px; }
+    @media (max-width: 640px) { .topbar { position: static; } .stats { white-space: normal; } #grid, .card { scroll-margin-top: 16px; } }
+
     @media (min-width: 641px) and (max-width: 820px) { .toolbar { grid-template-columns: minmax(0, 1fr) auto; } .stats { grid-column: 1 / -1; justify-content: space-between; } }
     @media (max-width: 640px) { .topbar-inner { padding: 18px 16px 14px; } main { padding: 23px 16px 52px; } .masthead { display: block; } .resume-button { margin-top: 14px; } .toolbar { grid-template-columns: 1fr; gap: 10px; margin-top: 17px; } .voice-control { justify-content: space-between; } .stats { justify-content: space-between; } }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
@@ -571,54 +629,122 @@ HTML_TEMPLATE = r'''<!doctype html>
           <input id="search" type="search" autocomplete="off" placeholder="搜索单词、释义或词性…" aria-label="搜索单词、释义或词性">
           <div id="search-results" class="search-results" role="listbox"></div>
         </div>
-        <label class="voice-control" for="voice-select"><span>发音</span><select id="voice-select" aria-label="选择发音口音"><option value="en-US">美式 English (US)</option><option value="en-GB">英式 English (UK)</option></select></label>
-        <div class="stats"><span><strong id="visible-count">0</strong> / <span id="total-count">0</span> 词</span><span class="meter" title="学习进度"><i id="progress-meter"></i></span><span id="progress-label">未开始</span></div>
+        <label class="voice-control" for="voice-select"><span>发音</span><select id="voice-select" aria-label="选择发音口音"><option value="en-GB" selected>英式 English (UK)</option><option value="en-US">美式 English (US)</option></select></label>
+        <div class="stats"><span><strong id="visible-count">0</strong> / <span id="total-count">0</span> 词</span><span id="progress-label">未开始</span></div>
       </div>
+      <div class="study-toolbar">
+        <label><input id="review-only" type="checkbox"> 只看需巩固（<span id="review-count">0</span>）</label>
+        <button id="export-study" type="button">导出学习记录</button>
+        <button id="import-study" type="button">导入学习记录</button>
+        <input id="import-file" type="file" accept="application/json,.json" hidden>
+      </div>
+      <p id="storage-status" role="status">标记自动保存在此浏览器 · 建议定期导出备份</p>
     </div>
   </header>
   <main>
     <div class="section-line"><span id="section-title">全部词汇</span><span id="loaded-count">正在准备…</span></div>
     <section id="grid" aria-live="polite"></section>
     <div id="empty" class="empty-state">没有找到匹配的单词，请换个关键词试试。</div>
-    <div id="loading" class="loading">正在加载词卡…</div>
-    <div id="sentinel" class="sentinel" aria-hidden="true"></div>
+    <nav class="pagination" aria-label="词卡分页">
+      <button id="previous-page" type="button">上一页</button><span id="page-label"></span><button id="next-page" type="button">下一页</button>
+    </nav>
   </main>
   <script>
     const VOCAB = __VOCAB_JSON__;
-    const PROGRESS_KEY = "qwentoword-progress-v1";
+    const PROGRESS_KEY = 'qwentoword-progress-v1';
+    const RECORD_PREFIX = 'vocabulary-study-v2:word:';
+    const POSITION_KEY = 'vocabulary-study-v2:position';
     const BATCH_SIZE = 36;
-    const state = { query: "", matches: VOCAB, rendered: 0, lastId: null };
-    const grid = document.getElementById("grid");
-    const loading = document.getElementById("loading");
-    const empty = document.getElementById("empty");
-    const search = document.getElementById("search");
-    const searchResults = document.getElementById("search-results");
-    const voiceSelect = document.getElementById("voice-select");
+    const wordKey = word => String(word).normalize('NFKC').trim().toLowerCase();
+    const byId = new Map(VOCAB.map(item => [item.id, item]));
+    const byWord = new Map(VOCAB.map(item => [wordKey(item.word), item]));
+    const searchIndex = new Map(VOCAB.map(item => [item.id, [item.id, item.word, item.translate, item.part_of_speech, item.memory_techniques, item.similar_words, item.example_sentence, item.english_definition].join(' ').toLowerCase()]));
+    const records = new Map();
+    const flipped = new Set();
+    const state = { query: '', matches: VOCAB, page: 0, lastId: null, reviewOnly: false };
+    const grid = document.getElementById('grid');
+    const empty = document.getElementById('empty');
+    const search = document.getElementById('search');
+    const searchResults = document.getElementById('search-results');
+    const voiceSelect = document.getElementById('voice-select');
+    const VOICE_KEY = 'qwentoword-voice-v1';
     const speechState = { voices: [] };
-    const esc = value => String(value ?? "").replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[character]));
-    function loadProgress() { try { return JSON.parse(localStorage.getItem(PROGRESS_KEY) || "null"); } catch (_) { return null; } }
-    function saveProgress(card) {
-      if (!card) return;
-      state.lastId = card.dataset.id;
-      try { localStorage.setItem(PROGRESS_KEY, JSON.stringify({ id: state.lastId, scrollY: window.scrollY, at: Date.now() })); } catch (_) {}
-      updateProgress();
-      document.querySelectorAll(".card.current").forEach(node => node.classList.remove("current"));
-      card.classList.add("current");
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
+    let storageFailed = false;
+    function storageNotice(message, error = false) {
+      if (error) storageFailed = true;
+      const status = document.getElementById('storage-status');
+      status.textContent = storageFailed ? '本地保存不完整，请导出备份。' + (error ? message : '') : message;
+      status.classList.toggle('error', storageFailed);
     }
-    function progressId(progress) {
-      if (!progress) return null;
-      return progress.id && VOCAB.some(item => item.id === String(progress.id)) ? String(progress.id) : null;
+    function validRecord(value) {
+      return value && typeof value.word === 'string' && value.word.length > 0 && value.word.length <= 500
+        && wordKey(value.word).length > 0 && typeof value.review === 'boolean' && Number.isSafeInteger(value.at) && value.at >= 0;
+    }
+    function validPosition(value) {
+      return value && typeof value.word === 'string' && value.word.length <= 500 && Number.isSafeInteger(value.at) && value.at >= 0;
+    }
+    function readSaved(key, validate) {
+      let foundInvalid = false;
+      for (const candidate of [key, key + ':backup']) {
+        try {
+          const raw = localStorage.getItem(candidate);
+          if (raw === null) continue;
+          const value = JSON.parse(raw);
+          if (validate(value)) {
+            if (foundInvalid) storageNotice('已从备用记录恢复，请导出备份。');
+            return value;
+          }
+          foundInvalid = true;
+        } catch (_) { foundInvalid = true; }
+      }
+      if (foundInvalid) storageNotice('无法读取部分记录。', true);
+      return null;
+    }
+    function writeSaved(key, value) {
+      const data = JSON.stringify(value);
+      try {
+        localStorage.setItem(key, data);
+        localStorage.setItem(key + ':backup', data);
+        storageNotice('已保存到此浏览器 · 建议定期导出备份');
+        return true;
+      } catch (_) {
+        storageNotice('当前改动仍在本页，关闭前请导出。', true);
+        return false;
+      }
+    }
+    function recordKey(word) { return RECORD_PREFIX + encodeURIComponent(wordKey(word)); }
+    function isReview(item) { return records.get(wordKey(item.word))?.review === true; }
+    function setReview(item) {
+      const key = wordKey(item.word);
+      const latest = readSaved(recordKey(key), validRecord);
+      const previous = records.get(key);
+      const current = latest && (!previous || latest.at > previous.at) ? latest : previous;
+      const value = { word: key, review: current?.review !== true, at: Math.max(Date.now(), (previous?.at || 0) + 1, (latest?.at || 0) + 1) };
+      records.set(key, value);
+      writeSaved(recordKey(key), value);
+      saveProgress(item.id);
+      setQuery(search.value, false);
+      const focusCard = document.getElementById(`word-card-${item.id}`) || grid.firstElementChild;
+      (focusCard?.querySelector('[data-review]') || document.getElementById('review-only')).focus({ preventScroll: true });
+    }
+    function saveProgress(id) {
+      const item = byId.get(id);
+      if (!item) return;
+      state.lastId = id;
+      writeSaved(POSITION_KEY, { word: wordKey(item.word), at: Date.now() });
+      updateProgress();
     }
     function updateProgress() {
-      const index = VOCAB.findIndex(item => item.id === state.lastId);
-      const ratio = index < 0 ? 0 : (index + 1) / Math.max(1, VOCAB.length);
-      document.getElementById("progress-meter").style.width = `${ratio * 100}%`;
-      document.getElementById("progress-label").textContent = index < 0 ? "未开始" : `已学至 ${state.lastId}`;
+      const item = byId.get(state.lastId);
+      document.getElementById('progress-label').textContent = item ? `上次：${item.word}` : '未开始';
+      document.getElementById('resume').classList.toggle('visible', Boolean(item));
+      for (const card of grid.children) card.classList.toggle('current', card.dataset.id === state.lastId);
     }
     function iconSpeaker() { return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5Z"></path><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"></path></svg>'; }
     function refreshVoices() { speechState.voices = "speechSynthesis" in window ? window.speechSynthesis.getVoices() : []; }
     function voiceFor(locale) {
-      const normalisedLocale = locale.toLowerCase();
+      const normalisedLocale = locale.toLowerCase().replace("_", "-");
       return speechState.voices.find(voice => voice.lang.toLowerCase() === normalisedLocale)
         || speechState.voices.find(voice => voice.lang.toLowerCase().startsWith(`${normalisedLocale}-`));
     }
@@ -626,11 +752,14 @@ HTML_TEMPLATE = r'''<!doctype html>
       if (!("speechSynthesis" in window)) { alert("当前浏览器不支持单词朗读"); return; }
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(word);
-      const locale = voiceSelect.value || "en-US";
+      const locale = voiceSelect.value || "en-GB";
       utterance.lang = locale; utterance.rate = rate || .86; utterance.pitch = 1;
       const voice = voiceFor(locale);
       if (voice) utterance.voice = voice;
       window.speechSynthesis.speak(utterance);
+    }
+    function speechText(value) {
+      return String(value ?? "").replace(/(?:\s*(?:\([^()（）]*\)|（[^()（）]*）))+\s*([.!?。！？]?)\s*$/, "$1").trim();
     }
     function openDictionary(word) {
       const term = String(word || "").trim();
@@ -643,45 +772,206 @@ HTML_TEMPLATE = r'''<!doctype html>
       const phoneticMarkup = phonetic
         ? `<button class="phonetic-button" type="button" data-speak-phonetic="${esc(item.word)}" aria-label="朗读 ${esc(item.word)} 的音标"><span class="phonetic">/${esc(phonetic.replace(/^\/+|\/+$/g, ""))}/</span></button>`
         : `<button class="phonetic-button" type="button" data-speak-phonetic="${esc(item.word)}" aria-label="朗读 ${esc(item.word)}"><span class="phonetic missing">音标待补充</span></button>`;
-      const fields = [["词形变化", item.transformation], ["记忆方法", item.memory_techniques], ["近义辨析", item.similar_words]];
-      return `<article class="card" id="word-card-${esc(item.id)}" data-id="${esc(item.id)}"><div class="card-head"><div><h2 class="word" data-word="${esc(item.word)}" tabindex="0" title="双击查询有道词典">${esc(item.word)}</h2><div class="word-meta">${phoneticMarkup}<span aria-hidden="true">·</span><span>${esc(item.part_of_speech) || "词性待补充"}</span></div></div><div class="badges"><span class="word-id">${esc(item.id)}</span><button class="speak" type="button" data-speak="${esc(item.word)}" aria-label="朗读 ${esc(item.word)}" title="朗读单词">${iconSpeaker()}</button>${item.number ? `<div class="number">${esc(item.number)}</div>` : ""}</div></div>${item.translate ? `<p class="meaning">${esc(item.translate)}</p>` : `<p class="meaning detail-value empty">释义待补充</p>`}<div class="details">${fields.map(([label, value]) => `<div class="detail"><span class="detail-label">${label}</span><span class="detail-value${value ? "" : " empty"}">${esc(value) || "待补充"}</span></div>`).join("")}</div></article>`;
+      const fields = [["英译英", item.english_definition], ["词形变化", item.transformation], ["记忆方法", item.memory_techniques], ["近义辨析", item.similar_words], ["日常例句", item.example_sentence]];
+      const detailMarkup = ([label, value]) => {
+        const content = value ? (label === "日常例句" || label === "英译英"
+          ? `<button class="example-button" type="button" data-speak-example="${esc(value)}" aria-label="朗读${esc(label)}">${iconSpeaker()}${esc(value)}</button>`
+          : esc(value)) : "待补充";
+        return `<div class="detail"><span class="detail-label">${label}</span><span class="detail-value${value ? "" : " empty"}">${content}</span></div>`;
+      };
+      return `<article class="card" id="word-card-${esc(item.id)}" data-id="${esc(item.id)}"><div class="card-front"${flipped.has(item.id) ? " hidden" : ""}><div class="card-head"><div><h2 class="word" data-word="${esc(item.word)}" tabindex="0" title="双击查询有道词典">${esc(item.word)}</h2><div class="word-meta">${phoneticMarkup}<span aria-hidden="true">·</span><span>${esc(item.part_of_speech) || "词性待补充"}</span></div></div><div class="badges"><span class="word-id">${esc(item.id)}</span><button class="speak" type="button" data-speak="${esc(item.word)}" aria-label="朗读 ${esc(item.word)}" title="朗读单词">${iconSpeaker()}</button>${item.number ? `<div class="number">${esc(item.number)}</div>` : ""}</div></div>${item.translate ? `<p class="meaning">${esc(item.translate)}</p>` : `<p class="meaning detail-value empty">释义待补充</p>`}<div class="details">${fields.map(detailMarkup).join("")}</div></div><div class="card-back"${flipped.has(item.id) ? "" : " hidden"}><h2 class="word" data-word="${esc(item.word)}">${esc(item.word)}</h2><div class="detail-value">${item.example_sentence ? `<button class="example-button" type="button" data-speak-example="${esc(item.example_sentence)}" aria-label="朗读日常例句">${esc(item.example_sentence)}</button>` : "例句待补充"}</div></div><div class="card-actions"><button type="button" data-review="${esc(item.id)}" aria-pressed="${isReview(item)}">${isReview(item) ? "✓ 需巩固" : "标记需巩固"}</button><button type="button" data-flip="${esc(item.id)}" aria-pressed="${flipped.has(item.id)}">${flipped.has(item.id) ? "查看释义" : "翻到背面"}</button></div></article>`;
     }
-    function renderNextBatch() {
-      if (state.rendered >= state.matches.length) { loading.textContent = state.matches.length ? "已加载全部匹配词汇" : ""; return; }
-      const end = Math.min(state.rendered + BATCH_SIZE, state.matches.length);
-      const fragment = document.createDocumentFragment();
-      const holder = document.createElement("div");
-      holder.innerHTML = state.matches.slice(state.rendered, end).map(cardMarkup).join("");
-      while (holder.firstElementChild) fragment.appendChild(holder.firstElementChild);
-      grid.appendChild(fragment); state.rendered = end;
-      document.getElementById("loaded-count").textContent = `已显示 ${end} / ${state.matches.length}`;
-      if (state.rendered >= state.matches.length) loading.textContent = state.matches.length ? "已加载全部匹配词汇" : "";
-      observeCards();
-      updateVisibleCount();
+    function renderPage() {
+      state.page = Math.max(0, Math.min(state.page, Math.ceil(state.matches.length / BATCH_SIZE) - 1));
+      const start = state.page * BATCH_SIZE;
+      grid.innerHTML = state.matches.slice(start, start + BATCH_SIZE).map(cardMarkup).join('');
+      document.getElementById('visible-count').textContent = state.matches.length;
+      document.getElementById('total-count').textContent = VOCAB.length;
+      document.getElementById('review-count').textContent = VOCAB.filter(isReview).length;
+      document.getElementById('loaded-count').textContent = state.matches.length ? `${start + 1}–${Math.min(start + BATCH_SIZE, state.matches.length)} / ${state.matches.length}` : '0 / 0';
+      document.getElementById('page-label').textContent = `${state.page + 1} / ${Math.max(1, Math.ceil(state.matches.length / BATCH_SIZE))} 页`;
+      document.getElementById('previous-page').disabled = state.page === 0;
+      document.getElementById('next-page').disabled = start + BATCH_SIZE >= state.matches.length;
+      document.getElementById('section-title').textContent = (state.reviewOnly ? '需巩固词汇' : '全部词汇') + (state.query ? ` · 搜索“${state.query}”` : '');
+      empty.classList.toggle('visible', !state.matches.length);
+      empty.textContent = state.reviewOnly ? '没有符合条件的需巩固单词。可关闭筛选，在词卡底部标记。' : '没有找到匹配的单词，请换个关键词试试。';
+      updateProgress();
     }
-    function observeCards() { document.querySelectorAll(".card:not([data-observed])").forEach(card => { card.dataset.observed = "1"; cardObserver.observe(card); }); }
-    function updateVisibleCount() { document.getElementById("visible-count").textContent = state.matches.length; document.getElementById("total-count").textContent = VOCAB.length; document.getElementById("section-title").textContent = state.query ? `搜索 “${state.query}”` : "全部词汇"; empty.classList.toggle("visible", !state.matches.length); }
-    function resetResults(matches, query) { state.matches = matches; state.query = query; state.rendered = 0; cardObserver.disconnect(); grid.innerHTML = ""; loading.textContent = matches.length ? "正在加载词卡…" : ""; updateVisibleCount(); renderNextBatch(); }
-    function searchItems(query) { const normalized = query.trim().toLowerCase(); if (!normalized) return VOCAB; return VOCAB.filter(item => [item.id, item.word, item.translate, item.part_of_speech, item.memory_techniques, item.similar_words].join(" ").toLowerCase().includes(normalized)); }
+    function matchingItems(query) {
+      const normalized = query.trim().toLowerCase();
+      return VOCAB.filter(item => (!state.reviewOnly || isReview(item)) && (!normalized || searchIndex.get(item.id).includes(normalized)));
+    }
+    function setQuery(query, resetPage = true) {
+      state.query = query.trim();
+      state.matches = matchingItems(query);
+      if (resetPage) state.page = 0;
+      renderPage();
+      searchResults.classList.remove('open');
+    }
+    function searchItems(query) {
+      const normalized = query.trim().toLowerCase();
+      if (!normalized) return [];
+      const matches = matchingItems(query);
+      return matches.filter(item => item.word.toLowerCase() === normalized).concat(matches.filter(item => item.word.toLowerCase() !== normalized));
+    }
     function showResults(query) {
-      const matches = searchItems(query).slice(0, 8); searchResults.innerHTML = matches.map(item => `<button class="search-result" type="button" data-result-id="${esc(item.id)}" role="option"><span>${esc(item.word)}</span><small>${esc(item.translate || item.part_of_speech || "")}</small></button>`).join(""); searchResults.classList.toggle("open", Boolean(query.trim() && matches.length));
+      const term = query.trim();
+      const matches = searchItems(term).slice(0, 8);
+      searchResults.innerHTML = matches.length
+        ? matches.map(item => `<button class="search-result" type="button" data-result-id="${esc(item.id)}"><span>${esc(item.word)}</span><small>${esc(item.translate || '')}</small></button>`).join('')
+        : term ? `<button class="search-result" type="button" data-dictionary-word="${esc(term)}">在有道词典查询 ${esc(term)}</button>` : '';
+      searchResults.classList.toggle('open', Boolean(term));
     }
-    function locate(id) { const index = state.matches.findIndex(item => item.id === id); if (index < 0) return; while (state.rendered <= index) renderNextBatch(); requestAnimationFrame(() => { const target = document.getElementById(`word-card-${id}`); if (target) { target.scrollIntoView({ behavior: "smooth", block: "center" }); saveProgress(target); } }); }
-    const cardObserver = new IntersectionObserver(entries => { const visible = entries.filter(entry => entry.isIntersecting && entry.intersectionRatio >= .52); if (visible.length) { visible.sort((a, b) => { const first = a.target.getBoundingClientRect(); const second = b.target.getBoundingClientRect(); return first.top - second.top || first.left - second.left; }); saveProgress(visible[0].target); } }, { threshold: [.52] });
-    const sentinelObserver = new IntersectionObserver(entries => { if (entries[0].isIntersecting) renderNextBatch(); }, { rootMargin: "650px" });
-    document.addEventListener("click", event => { const speakButton = event.target.closest("[data-speak]"); if (speakButton) speak(speakButton.dataset.speak); const ipaButton = event.target.closest("[data-speak-phonetic]"); if (ipaButton) speak(ipaButton.dataset.speakPhonetic, .63); const result = event.target.closest("[data-result-id]"); if (result) { const item = VOCAB.find(row => row.id === result.dataset.resultId); if (item) { search.value = item.word; resetResults([item], item.word); searchResults.classList.remove("open"); locate(item.id); } } });
-    document.addEventListener("dblclick", event => { const word = event.target.closest("[data-word]"); if (word) openDictionary(word.dataset.word); });
-    search.addEventListener("input", () => { const value = search.value; showResults(value); resetResults(searchItems(value), value.trim()); });
-    search.addEventListener("keydown", event => { if (event.key === "Escape") { searchResults.classList.remove("open"); search.blur(); } if (event.key === "Enter") { const first = searchItems(search.value)[0]; if (first) { searchResults.classList.remove("open"); locate(first.id); } } });
-    document.addEventListener("click", event => { if (!event.target.closest(".search-wrap")) searchResults.classList.remove("open"); });
-    document.getElementById("resume").addEventListener("click", () => { const id = progressId(loadProgress()); if (id) { search.value = ""; resetResults(VOCAB, ""); locate(id); } });
-    document.getElementById("total-count").textContent = VOCAB.length;
-    refreshVoices();
-    if ("speechSynthesis" in window && "onvoiceschanged" in window.speechSynthesis) window.speechSynthesis.addEventListener("voiceschanged", refreshVoices);
-    updateVisibleCount(); updateProgress(); renderNextBatch(); sentinelObserver.observe(document.getElementById("sentinel"));
-    const progress = loadProgress();
-    const savedProgressId = progressId(progress);
-    if (savedProgressId) { document.getElementById("resume").classList.add("visible"); state.lastId = savedProgressId; updateProgress(); setTimeout(() => locate(savedProgressId), 500); }
+    function locate(id) {
+      const index = state.matches.findIndex(item => item.id === id);
+      if (index < 0) return;
+      state.page = Math.floor(index / BATCH_SIZE);
+      renderPage();
+      const target = document.getElementById(`word-card-${id}`);
+      target?.scrollIntoView({ block: 'start' });
+      saveProgress(id);
+    }
+    function turnPage(direction) {
+      state.page += direction;
+      renderPage();
+      const first = state.matches[state.page * BATCH_SIZE];
+      if (first) saveProgress(first.id);
+      grid.scrollIntoView({ block: 'start' });
+    }
+    // Shared by both card faces: pronunciation and dictionary controls never flip a card.
+    document.addEventListener('click', event => {
+      const card = event.target.closest('.card');
+      if (card) saveProgress(card.dataset.id);
+      const review = event.target.closest('[data-review]');
+      if (review) { setReview(byId.get(review.dataset.review)); return; }
+      const flip = event.target.closest('[data-flip]');
+      if (flip) {
+        const id = flip.dataset.flip;
+        if (flipped.has(id)) flipped.delete(id); else flipped.add(id);
+        card.querySelector('.card-front').hidden = flipped.has(id);
+        card.querySelector('.card-back').hidden = !flipped.has(id);
+        flip.setAttribute('aria-pressed', String(flipped.has(id)));
+        flip.textContent = flipped.has(id) ? '查看释义' : '翻到背面';
+        return;
+      }
+      const speakButton = event.target.closest('[data-speak]');
+      if (speakButton) speak(speakButton.dataset.speak);
+      const exampleButton = event.target.closest('[data-speak-example]');
+      if (exampleButton) speak(speechText(exampleButton.dataset.speakExample), .8);
+      const ipaButton = event.target.closest('[data-speak-phonetic]');
+      if (ipaButton) speak(ipaButton.dataset.speakPhonetic, .63);
+      const result = event.target.closest('[data-result-id]');
+      if (result) { searchResults.classList.remove('open'); locate(result.dataset.resultId); }
+      const dictionary = event.target.closest('[data-dictionary-word]');
+      if (dictionary) { openDictionary(dictionary.dataset.dictionaryWord); searchResults.classList.remove('open'); }
+      if (!event.target.closest('.search-wrap')) searchResults.classList.remove('open');
+    });
+    document.addEventListener('dblclick', event => { const word = event.target.closest('[data-word]'); if (word) openDictionary(word.dataset.word); });
+    search.addEventListener('input', () => { setQuery(search.value); showResults(search.value); });
+    search.addEventListener('keydown', event => {
+      if (event.isComposing) return;
+      if (event.key === 'Escape') { searchResults.classList.remove('open'); search.blur(); }
+      if (event.key === 'Enter' && search.value.trim()) {
+        event.preventDefault();
+        searchResults.classList.remove('open');
+        const first = searchItems(search.value)[0];
+        if (first) locate(first.id); else openDictionary(search.value);
+      }
+    });
+    document.getElementById('review-only').addEventListener('change', event => { state.reviewOnly = event.target.checked; setQuery(search.value); });
+    document.getElementById('previous-page').addEventListener('click', () => turnPage(-1));
+    document.getElementById('next-page').addEventListener('click', () => turnPage(1));
+    document.getElementById('resume').addEventListener('click', () => {
+      const id = state.lastId;
+      state.reviewOnly = false;
+      document.getElementById('review-only').checked = false;
+      search.value = '';
+      setQuery('');
+      if (id) locate(id);
+    });
+    function backupData() {
+      const item = byId.get(state.lastId);
+      return { format: 'vocabulary-study', version: 2, exportedAt: new Date().toISOString(), records: [...records.values()], position: item ? { word: wordKey(item.word), at: Date.now() } : null };
+    }
+    function importData(data) {
+      if (!data || data.format !== 'vocabulary-study' || data.version !== 2 || !Array.isArray(data.records) || data.records.length > 100000
+        || !data.records.every(validRecord) || (data.position !== null && !validPosition(data.position))) throw new Error('备份格式无效或版本不支持');
+      // Validate the whole file before touching existing records. Newer marks win, including removals.
+      for (const entry of data.records) {
+        const key = wordKey(entry.word);
+        if (!key) throw new Error('备份包含空白单词');
+      }
+      for (const entry of data.records) {
+        const key = wordKey(entry.word);
+        const current = records.get(key);
+        const disk = readSaved(recordKey(key), validRecord);
+        const latest = disk && (!current || disk.at > current.at) ? disk : current;
+        if (!latest || entry.at > latest.at) {
+          const record = { word: key, review: entry.review, at: entry.at };
+          records.set(key, record);
+          writeSaved(recordKey(key), record);
+        } else if (latest) records.set(key, latest);
+      }
+      const saved = readSaved(POSITION_KEY, validPosition);
+      if (data.position && (!saved || data.position.at > saved.at)) {
+        writeSaved(POSITION_KEY, data.position);
+        state.lastId = byWord.get(wordKey(data.position.word))?.id || state.lastId;
+      }
+      setQuery(search.value, false);
+    }
+    document.getElementById('export-study').addEventListener('click', () => {
+      const url = URL.createObjectURL(new Blob([JSON.stringify(backupData(), null, 2)], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url; link.download = `词汇学习记录-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+    const importInput = document.getElementById('import-file');
+    document.getElementById('import-study').addEventListener('click', () => importInput.click());
+    importInput.addEventListener('change', async () => {
+      const file = importInput.files[0];
+      if (!file) return;
+      try {
+        if (file.size > 20 * 1024 * 1024) throw new Error('备份文件超过 20 MB');
+        importData(JSON.parse(await file.text()));
+        storageNotice('备份已合并，已有的较新标记会保留。');
+      } catch (error) { storageNotice(`导入失败：${error.message}`); }
+      finally { importInput.value = ''; }
+    });
+    window.addEventListener('storage', event => {
+      if (event.key?.startsWith(RECORD_PREFIX) && !event.key.endsWith(':backup') && event.newValue) {
+        try {
+          const record = JSON.parse(event.newValue);
+          const current = records.get(wordKey(record.word));
+          if (validRecord(record) && (!current || record.at >= current.at)) { records.set(wordKey(record.word), record); setQuery(search.value, false); }
+        } catch (_) { storageNotice('其他窗口的记录无法读取。', true); }
+      }
+      if (event.key === null || (event.key?.startsWith(RECORD_PREFIX) && !event.newValue)) storageNotice('浏览器中的记录已被清除，请导出当前记录备份。', true);
+    });
+    function initializeStudy() {
+      try {
+        const keys = new Set();
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key?.startsWith(RECORD_PREFIX)) keys.add(key.replace(/:backup$/, ''));
+        }
+        for (const key of keys) { const value = readSaved(key, validRecord); if (value) records.set(wordKey(value.word), value); }
+        const position = readSaved(POSITION_KEY, validPosition);
+        if (position) state.lastId = byWord.get(wordKey(position.word))?.id || null;
+        else {
+          const legacy = JSON.parse(localStorage.getItem(PROGRESS_KEY) || 'null');
+          if (legacy && byId.has(legacy.id)) { state.lastId = legacy.id; writeSaved(POSITION_KEY, { word: wordKey(byId.get(legacy.id).word), at: Date.now() }); }
+        }
+        const voice = localStorage.getItem(VOICE_KEY);
+        if (['en-GB', 'en-US'].includes(voice)) voiceSelect.value = voice;
+      } catch (_) { storageNotice('无法读取本地记录。', true); }
+      voiceSelect.addEventListener('change', () => { try { localStorage.setItem(VOICE_KEY, voiceSelect.value); } catch (_) { storageNotice('口音设置未保存。', true); } });
+      refreshVoices();
+      if ('speechSynthesis' in window) window.speechSynthesis.addEventListener('voiceschanged', refreshVoices);
+      if (state.lastId) state.page = Math.floor(VOCAB.findIndex(item => item.id === state.lastId) / BATCH_SIZE);
+      renderPage();
+    }
+    initializeStudy();
   </script>
 </body>
 </html>
